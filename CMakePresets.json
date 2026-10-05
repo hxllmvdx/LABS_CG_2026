@@ -5,12 +5,14 @@
 			"name": "common",
 			"hidden": true,
 			"generator": "Ninja",
-			"cacheVariables": {}
+			"cacheVariables": {
+			    "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+			}
 		},
 		{
 			"name": "debug",
 			"inherits": "common",
-			"binaryDir": "build-debug",
+			"binaryDir": "build",
 			"cacheVariables": {
 				"CMAKE_BUILD_TYPE": "Debug"
 			}
