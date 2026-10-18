@@ -109,8 +109,10 @@ if(GLSLC_FOUND)
 		list(APPEND _SHADER_BINARIES ${SHADER_BINARY_PATH})
 	endmacro()
 
-	compile_shader(cube.vert)
-	compile_shader(cube.frag)
+	# Шейдеры лабораторной №2
+	compile_shader(lighting.vert)
+	compile_shader(lighting.frag)
+	compile_shader(unlit.frag)
 
 	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 	add_dependencies(${PROJECT_NAME} shaders)
