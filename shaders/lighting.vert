@@ -3,22 +3,20 @@
 layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec3 in_normal;
 
-// Set 0: данные сцены (общие для всех объектов)
 layout(set = 0, binding = 0) uniform SceneData {
 	mat4 view;
 	mat4 proj;
-	vec4 camera_pos;   // xyz + не используется
-	vec4 ambient;      // rgb + интенсивность
-	vec4 sun_dir;      // направление К солнцу (xyz)
-	vec4 sun_color;    // rgb + интенсивность
-	ivec4 counts;      // x - точечные источники, y - прожекторы
+	vec4 camera_pos;  
+	vec4 ambient;     
+	vec4 sun_dir;     
+	vec4 sun_color;   
+	ivec4 counts;     
 } scene;
 
-// Set 1: данные модели (свои для каждого объекта)
 layout(set = 1, binding = 0) uniform ObjectData {
 	mat4 model;
-	vec4 albedo;       // rgb = альбедо
-	vec4 specular;     // rgb = цвет блика, a = коэффициент блика
+	vec4 albedo;      
+	vec4 specular;    
 } object;
 
 layout(location = 0) out vec3 world_pos;

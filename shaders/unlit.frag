@@ -1,7 +1,5 @@
 #version 450
 
-// Постоянный цвет, без освещения - для визуализации источников света
-
 layout(set = 1, binding = 0) uniform ObjectData {
 	mat4 model;
 	vec4 albedo;
