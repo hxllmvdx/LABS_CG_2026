@@ -7,6 +7,9 @@
 
 #include <imgui.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "../shaders/stb_image.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -22,6 +25,7 @@ namespace {
 struct Vertex {
   glm::vec3 position;
   glm::vec3 normal;
+  glm::vec2 uv;
 };
 
 struct SceneData {
@@ -38,6 +42,7 @@ struct ObjectData {
   glm::mat4 model;
   alignas(16) glm::vec4 albedo;
   alignas(16) glm::vec4 specular;
+  alignas(16) glm::vec4 effect;
 };
 
 struct GpuPointLight {
@@ -59,6 +64,8 @@ struct Mesh {
 
 struct GpuObject {
   Mesh mesh;
+  int texture_index = 0;
+  bool liquid_glass = false;
 
   VkBuffer vertex_buffer = VK_NULL_HANDLE;
   VmaAllocation vertex_allocation = nullptr;
@@ -89,8 +96,11 @@ Mesh make_box_mesh(glm::vec3 min_corner, glm::vec3 max_corner) {
   auto face = [&](int a, int b, int c, int d, glm::vec3 normal) {
     const uint32_t base = uint32_t(mesh.vertices.size());
 
+    const glm::vec2 uvs[] = {{0.0f, 0.0f}, {1.0f, 0.0f},
+                             {1.0f, 1.0f}, {0.0f, 1.0f}};
+    int corner = 0;
     for (int i : {a, b, c, d}) {
-      mesh.vertices.push_back({p[i], normal});
+      mesh.vertices.push_back({p[i], normal, uvs[corner++]});
     }
 
     mesh.indices.insert(mesh.indices.end(), {
@@ -141,6 +151,18 @@ struct MaterialState {
   glm::vec3 albedo{0.75f, 0.72f, 0.68f};
   glm::vec3 specular{1.0f, 1.0f, 1.0f};
   float shininess = 32.0f;
+  float texture_scale = 1.0f;
+  float wave_amplitude = 0.025f;
+  float wave_frequency = 18.0f;
+  float wave_speed = 2.0f;
+};
+
+struct PostProcessState {
+  bool toon = true;
+  bool bloom = true;
+  float bloom_threshold = 0.8f;
+  float bloom_intensity = 1.2f;
+  float bloom_radius = 6.0f;
 };
 
 struct AppState {
@@ -157,20 +179,43 @@ struct AppState {
   std::vector<SpotLightState> spot_lights{SpotLightState{}};
 
   MaterialState material;
+  PostProcessState post_process;
 
   bool show_light_gizmos = true;
 };
 
 AppState state;
+double animation_time = 0.0;
 
 VkPipelineLayout vk_pipeline_layout;
 VkPipeline vk_pipeline_lit;
 VkPipeline vk_pipeline_unlit;
 VkPipeline vk_pipeline_lines;
+VkPipeline vk_pipeline_post;
 
-VkDescriptorSetLayout vk_set_layouts[2];
+VkDescriptorSetLayout vk_set_layouts[3];
 VkDescriptorPool vk_descriptor_pool;
 VkDescriptorSet vk_scene_descriptor_set;
+VkDescriptorSet vk_post_descriptor_set;
+
+VkImage vk_scene_color_image = VK_NULL_HANDLE;
+VmaAllocation vk_scene_color_allocation = nullptr;
+VkImageView vk_scene_color_view = VK_NULL_HANDLE;
+VkImage vk_scene_depth_image = VK_NULL_HANDLE;
+VmaAllocation vk_scene_depth_allocation = nullptr;
+VkImageView vk_scene_depth_view = VK_NULL_HANDLE;
+VkFramebuffer vk_scene_framebuffer = VK_NULL_HANDLE;
+VkRenderPass vk_scene_render_pass = VK_NULL_HANDLE;
+VkFormat vk_scene_depth_format = VK_FORMAT_UNDEFINED;
+VkSampler vk_scene_sampler = VK_NULL_HANDLE;
+VkExtent2D vk_scene_extent{};
+
+struct Texture {
+  VkImage image = VK_NULL_HANDLE;
+  VmaAllocation allocation = nullptr;
+  VkImageView view = VK_NULL_HANDLE;
+};
+std::vector<Texture> textures;
 
 VkBuffer vk_scene_uniform_buffer;
 VmaAllocation vk_scene_uniform_allocation;
@@ -282,6 +327,314 @@ bool upload_to_buffer(VkBuffer buffer, VmaAllocation allocation, const T *data,
   return true;
 }
 
+bool load_texture(const char *path, Texture &texture) {
+  auto &context = graphics::internal::context;
+  int width = 0;
+  int height = 0;
+  int channels = 0;
+  stbi_uc *pixels = stbi_load(path, &width, &height, &channels, STBI_rgb_alpha);
+  if (pixels == nullptr) {
+    std::cerr << "Failed to load texture: " << path << '\n';
+    return false;
+  }
+
+  const VkDeviceSize size = VkDeviceSize(width) * VkDeviceSize(height) * 4;
+  VmaAllocation staging_allocation = nullptr;
+  VkBuffer staging = create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                   &staging_allocation, nullptr);
+  if (staging == VK_NULL_HANDLE) {
+    stbi_image_free(pixels);
+    return false;
+  }
+  void *mapped = nullptr;
+  vmaMapMemory(context.allocator, staging_allocation, &mapped);
+  std::memcpy(mapped, pixels, size);
+  vmaFlushAllocation(context.allocator, staging_allocation, 0, VK_WHOLE_SIZE);
+  vmaUnmapMemory(context.allocator, staging_allocation);
+  stbi_image_free(pixels);
+
+  const VkImageCreateInfo image_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .extent = {uint32_t(width), uint32_t(height), 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+  };
+  VmaAllocationCreateInfo allocation_info = {};
+  allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
+  if (vmaCreateImage(context.allocator, &image_info, &allocation_info,
+                     &texture.image, &texture.allocation, nullptr) != VK_SUCCESS)
+    return false;
+
+  const VkCommandPoolCreateInfo pool_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .queueFamilyIndex = context.graphics_queue_index,
+  };
+  VkCommandPool pool = VK_NULL_HANDLE;
+  vkCreateCommandPool(context.device, &pool_info, nullptr, &pool);
+  const VkCommandBufferAllocateInfo allocate_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = pool,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1,
+  };
+  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+  vkAllocateCommandBuffers(context.device, &allocate_info, &command_buffer);
+  const VkCommandBufferBeginInfo begin_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+  };
+  vkBeginCommandBuffer(command_buffer, &begin_info);
+
+  VkImageMemoryBarrier barrier = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = texture.image,
+      .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                           .levelCount = 1,
+                           .layerCount = 1},
+  };
+  vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                       1, &barrier);
+  const VkBufferImageCopy copy = {
+      .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                           .layerCount = 1},
+      .imageExtent = {uint32_t(width), uint32_t(height), 1},
+  };
+  vkCmdCopyBufferToImage(command_buffer, staging, texture.image,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &barrier);
+  vkEndCommandBuffer(command_buffer);
+  const VkSubmitInfo submit = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &command_buffer,
+  };
+  vkQueueSubmit(context.graphics_queue, 1, &submit, VK_NULL_HANDLE);
+  vkQueueWaitIdle(context.graphics_queue);
+  vkDestroyCommandPool(context.device, pool, nullptr);
+  vmaDestroyBuffer(context.allocator, staging, staging_allocation);
+
+  const VkImageViewCreateInfo view_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = texture.image,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                           .levelCount = 1,
+                           .layerCount = 1},
+  };
+  return vkCreateImageView(context.device, &view_info, nullptr, &texture.view) ==
+         VK_SUCCESS;
+}
+
+void destroy_scene_target() {
+  auto &context = graphics::internal::context;
+  if (vk_scene_framebuffer != VK_NULL_HANDLE)
+    vkDestroyFramebuffer(context.device, vk_scene_framebuffer, nullptr);
+  if (vk_scene_depth_view != VK_NULL_HANDLE)
+    vkDestroyImageView(context.device, vk_scene_depth_view, nullptr);
+  if (vk_scene_color_view != VK_NULL_HANDLE)
+    vkDestroyImageView(context.device, vk_scene_color_view, nullptr);
+  if (vk_scene_depth_image != VK_NULL_HANDLE)
+    vmaDestroyImage(context.allocator, vk_scene_depth_image,
+                    vk_scene_depth_allocation);
+  if (vk_scene_color_image != VK_NULL_HANDLE)
+    vmaDestroyImage(context.allocator, vk_scene_color_image,
+                    vk_scene_color_allocation);
+  vk_scene_framebuffer = VK_NULL_HANDLE;
+  vk_scene_depth_view = VK_NULL_HANDLE;
+  vk_scene_color_view = VK_NULL_HANDLE;
+  vk_scene_depth_image = VK_NULL_HANDLE;
+  vk_scene_color_image = VK_NULL_HANDLE;
+}
+
+bool create_scene_render_pass() {
+  auto &context = graphics::internal::context;
+  for (VkFormat candidate : {VK_FORMAT_D24_UNORM_S8_UINT,
+                             VK_FORMAT_D32_SFLOAT_S8_UINT}) {
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(context.physical_device, candidate,
+                                        &properties);
+    if (properties.optimalTilingFeatures &
+        VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+      vk_scene_depth_format = candidate;
+      break;
+    }
+  }
+  if (vk_scene_depth_format == VK_FORMAT_UNDEFINED)
+    return false;
+
+  const VkAttachmentDescription attachments[] = {
+      {
+          .format = context.swapchain_format,
+          .samples = VK_SAMPLE_COUNT_1_BIT,
+          .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+          .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          .finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      },
+      {
+          .format = vk_scene_depth_format,
+          .samples = VK_SAMPLE_COUNT_1_BIT,
+          .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+          .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      },
+  };
+  const VkAttachmentReference color_reference = {
+      .attachment = 0,
+      .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+  };
+  const VkAttachmentReference depth_reference = {
+      .attachment = 1,
+      .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+  };
+  const VkSubpassDescription subpass = {
+      .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+      .colorAttachmentCount = 1,
+      .pColorAttachments = &color_reference,
+      .pDepthStencilAttachment = &depth_reference,
+  };
+  const VkSubpassDependency dependencies[] = {
+      {
+          .srcSubpass = VK_SUBPASS_EXTERNAL,
+          .dstSubpass = 0,
+          .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+          .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                          VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+          .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+      },
+      {
+          .srcSubpass = 0,
+          .dstSubpass = VK_SUBPASS_EXTERNAL,
+          .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+          .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+          .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+      },
+  };
+  const VkRenderPassCreateInfo create_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+      .attachmentCount = 2,
+      .pAttachments = attachments,
+      .subpassCount = 1,
+      .pSubpasses = &subpass,
+      .dependencyCount = 2,
+      .pDependencies = dependencies,
+  };
+  return vkCreateRenderPass(context.device, &create_info, nullptr,
+                            &vk_scene_render_pass) == VK_SUCCESS;
+}
+
+bool create_scene_target(VkExtent2D extent) {
+  auto &context = graphics::internal::context;
+  destroy_scene_target();
+
+  const VkImageCreateInfo image_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = context.swapchain_format,
+      .extent = {extent.width, extent.height, 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+  };
+  VmaAllocationCreateInfo allocation_info = {};
+  allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
+  if (vmaCreateImage(context.allocator, &image_info, &allocation_info,
+                     &vk_scene_color_image, &vk_scene_color_allocation,
+                     nullptr) != VK_SUCCESS)
+    return false;
+
+  VkImageCreateInfo depth_info = image_info;
+  depth_info.format = vk_scene_depth_format;
+  depth_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  if (vmaCreateImage(context.allocator, &depth_info, &allocation_info,
+                     &vk_scene_depth_image, &vk_scene_depth_allocation,
+                     nullptr) != VK_SUCCESS)
+    return false;
+
+  VkImageViewCreateInfo view_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = vk_scene_color_image,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = context.swapchain_format,
+      .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                           .levelCount = 1,
+                           .layerCount = 1},
+  };
+  if (vkCreateImageView(context.device, &view_info, nullptr,
+                        &vk_scene_color_view) != VK_SUCCESS)
+    return false;
+  view_info.image = vk_scene_depth_image;
+  view_info.format = depth_info.format;
+  view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  if (vkCreateImageView(context.device, &view_info, nullptr,
+                        &vk_scene_depth_view) != VK_SUCCESS)
+    return false;
+
+  const VkImageView attachments[] = {vk_scene_color_view, vk_scene_depth_view};
+  const VkFramebufferCreateInfo framebuffer_info = {
+      .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+      .renderPass = vk_scene_render_pass,
+      .attachmentCount = 2,
+      .pAttachments = attachments,
+      .width = extent.width,
+      .height = extent.height,
+      .layers = 1,
+  };
+  if (vkCreateFramebuffer(context.device, &framebuffer_info, nullptr,
+                          &vk_scene_framebuffer) != VK_SUCCESS)
+    return false;
+
+  const VkDescriptorImageInfo descriptor_image = {
+      .sampler = vk_scene_sampler,
+      .imageView = vk_scene_color_view,
+      .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+  };
+  const VkWriteDescriptorSet write = {
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet = vk_post_descriptor_set,
+      .dstBinding = 0,
+      .descriptorCount = 1,
+      .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      .pImageInfo = &descriptor_image,
+  };
+  vkUpdateDescriptorSets(context.device, 1, &write, 0, nullptr);
+  vk_scene_extent = extent;
+  return true;
+}
+
 bool create_pipeline(const char *vert_path, const char *frag_path,
                      VkPrimitiveTopology topology, VkCullModeFlags cull_mode,
                      VkPipeline *out_pipeline) {
@@ -327,13 +680,19 @@ bool create_pipeline(const char *vert_path, const char *frag_path,
           .format = VK_FORMAT_R32G32B32_SFLOAT,
           .offset = offsetof(Vertex, normal),
       },
+      {
+          .location = 2,
+          .binding = 0,
+          .format = VK_FORMAT_R32G32_SFLOAT,
+          .offset = offsetof(Vertex, uv),
+      },
   };
 
   const VkPipelineVertexInputStateCreateInfo vertex_input = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
       .vertexBindingDescriptionCount = 1,
       .pVertexBindingDescriptions = &vertex_binding,
-      .vertexAttributeDescriptionCount = 2,
+      .vertexAttributeDescriptionCount = 3,
       .pVertexAttributeDescriptions = vertex_attributes,
   };
 
@@ -404,7 +763,8 @@ bool create_pipeline(const char *vert_path, const char *frag_path,
       .pColorBlendState = &color_blend,
       .pDynamicState = &dynamic_state,
       .layout = vk_pipeline_layout,
-      .renderPass = context.render_pass,
+      .renderPass = out_pipeline == &vk_pipeline_post ? context.render_pass
+                                                     : vk_scene_render_pass,
       .subpass = 0,
   };
 
@@ -427,7 +787,7 @@ bool create_graphics_pipelines() {
 
   const VkPipelineLayoutCreateInfo pipeline_layout_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-      .setLayoutCount = 2,
+      .setLayoutCount = 3,
       .pSetLayouts = vk_set_layouts,
   };
 
@@ -452,6 +812,12 @@ bool create_graphics_pipelines() {
   if (!create_pipeline("shaders/lighting.vert.spv", "shaders/unlit.frag.spv",
                        VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_CULL_MODE_NONE,
                        &vk_pipeline_lines)) {
+    return false;
+  }
+
+  if (!create_pipeline("shaders/lighting.vert.spv", "shaders/post.frag.spv",
+                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_CULL_MODE_NONE,
+                       &vk_pipeline_post)) {
     return false;
   }
 
@@ -517,17 +883,26 @@ bool create_descriptor_stuff() {
     return false;
   }
 
-  const VkDescriptorSetLayoutBinding object_binding = {
-      .binding = 0,
-      .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-      .descriptorCount = 1,
-      .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+  const VkDescriptorSetLayoutBinding object_bindings[] = {
+      {
+          .binding = 0,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+          .descriptorCount = 1,
+          .stageFlags =
+              VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+      },
+      {
+          .binding = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+      },
   };
 
   const VkDescriptorSetLayoutCreateInfo object_layout_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 1,
-      .pBindings = &object_binding,
+      .bindingCount = 2,
+      .pBindings = object_bindings,
   };
 
   if (vkCreateDescriptorSetLayout(context.device, &object_layout_info, nullptr,
@@ -536,18 +911,36 @@ bool create_descriptor_stuff() {
     return false;
   }
 
+  const VkDescriptorSetLayoutBinding post_binding = {
+      .binding = 0,
+      .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+  };
+  const VkDescriptorSetLayoutCreateInfo post_layout_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .bindingCount = 1,
+      .pBindings = &post_binding,
+  };
+  if (vkCreateDescriptorSetLayout(context.device, &post_layout_info, nullptr,
+                                  &vk_set_layouts[2]) != VK_SUCCESS)
+    return false;
+
   const uint32_t uniform_count =
       1 + uint32_t(objects.size()) + GIZMO_SLOT_COUNT;
   const VkDescriptorPoolSize pool_sizes[] = {
       {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
        .descriptorCount = uniform_count},
       {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2},
+      {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+       .descriptorCount =
+           1 + uint32_t(objects.size()) + GIZMO_SLOT_COUNT},
   };
 
   const VkDescriptorPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-      .maxSets = 1 + uint32_t(objects.size()) + GIZMO_SLOT_COUNT,
-      .poolSizeCount = 2,
+      .maxSets = 2 + uint32_t(objects.size()) + GIZMO_SLOT_COUNT,
+      .poolSizeCount = 3,
       .pPoolSizes = pool_sizes,
   };
 
@@ -555,6 +948,18 @@ bool create_descriptor_stuff() {
                              &vk_descriptor_pool) != VK_SUCCESS) {
     std::cerr << "Failed to create descriptor pool\n";
     return false;
+  }
+
+  {
+    const VkDescriptorSetAllocateInfo allocate_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = vk_descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &vk_set_layouts[2],
+    };
+    if (vkAllocateDescriptorSets(context.device, &allocate_info,
+                                 &vk_post_descriptor_set) != VK_SUCCESS)
+      return false;
   }
 
   {
@@ -723,7 +1128,9 @@ bool initialize() {
   objects.resize(std::size(scene_boxes));
   for (size_t i = 0; i < objects.size(); ++i) {
     objects[i].mesh = make_box_mesh(scene_boxes[i].min, scene_boxes[i].max);
+    objects[i].texture_index = int(i % 3);
   }
+  objects[4].liquid_glass = true;
 
   gizmo_cube.mesh = make_box_mesh({-0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, 0.5f});
 
@@ -807,6 +1214,30 @@ bool initialize() {
 
   if (!create_descriptor_stuff())
     return false;
+  if (!create_scene_render_pass())
+    return false;
+
+  const VkSamplerCreateInfo sampler_info = {
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter = VK_FILTER_LINEAR,
+      .minFilter = VK_FILTER_LINEAR,
+      .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+      .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .maxLod = 0.0f,
+  };
+  if (vkCreateSampler(graphics::internal::context.device, &sampler_info, nullptr,
+                      &vk_scene_sampler) != VK_SUCCESS)
+    return false;
+  for (const char *path : {"assets/D.jpeg", "assets/les.jpeg",
+                           "assets/meme.jpeg"}) {
+    textures.emplace_back();
+    if (!load_texture(path, textures.back()))
+      return false;
+  }
+  if (!create_scene_target(graphics::internal::context.swapchain_extent))
+    return false;
   if (!create_graphics_pipelines())
     return false;
 
@@ -818,13 +1249,23 @@ void shutdown() {
 
   vkDeviceWaitIdle(context.device);
 
+  destroy_scene_target();
+  for (auto &texture : textures) {
+    vkDestroyImageView(context.device, texture.view, nullptr);
+    vmaDestroyImage(context.allocator, texture.image, texture.allocation);
+  }
+  textures.clear();
+  vkDestroySampler(context.device, vk_scene_sampler, nullptr);
   vkDestroyPipeline(context.device, vk_pipeline_lit, nullptr);
   vkDestroyPipeline(context.device, vk_pipeline_unlit, nullptr);
   vkDestroyPipeline(context.device, vk_pipeline_lines, nullptr);
+  vkDestroyPipeline(context.device, vk_pipeline_post, nullptr);
   vkDestroyPipelineLayout(context.device, vk_pipeline_layout, nullptr);
+  vkDestroyRenderPass(context.device, vk_scene_render_pass, nullptr);
   vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
   vkDestroyDescriptorSetLayout(context.device, vk_set_layouts[0], nullptr);
   vkDestroyDescriptorSetLayout(context.device, vk_set_layouts[1], nullptr);
+  vkDestroyDescriptorSetLayout(context.device, vk_set_layouts[2], nullptr);
 
   vmaDestroyBuffer(context.allocator, vk_scene_uniform_buffer,
                    vk_scene_uniform_allocation);
@@ -854,7 +1295,8 @@ void shutdown() {
   objects.clear();
 }
 
-void update([[maybe_unused]] double time) {
+void update(double time) {
+  animation_time = time;
   auto &camera = state.camera;
 
   ImGui::Begin("Camera");
@@ -946,11 +1388,47 @@ void update([[maybe_unused]] double time) {
   ImGui::ColorEdit3("Specular color", &state.material.specular.x);
   ImGui::SliderFloat("Shininess", &state.material.shininess, 1.0f, 256.0f,
                      "%.0f");
+  ImGui::SliderFloat("Texture scale", &state.material.texture_scale, 0.25f, 4.0f);
+  ImGui::SeparatorText("Liquid glass texture waves");
+  ImGui::SliderFloat("Wave amplitude", &state.material.wave_amplitude, 0.0f, 0.1f);
+  ImGui::SliderFloat("Wave frequency", &state.material.wave_frequency, 1.0f, 50.0f);
+  ImGui::SliderFloat("Wave speed", &state.material.wave_speed, 0.0f, 6.0f);
+  ImGui::End();
+
+  const char *texture_names[] = {"D.jpeg", "les.jpeg", "meme.jpeg"};
+  ImGui::Begin("Model textures");
+  for (size_t i = 0; i < objects.size(); ++i) {
+    ImGui::PushID(int(i));
+    const char *label = i == 4 ? "Central cube" : (i < 4 ? "Room surface" : "Table part");
+    ImGui::SeparatorText(label);
+    ImGui::Combo("Texture", &objects[i].texture_index, texture_names, 3);
+    ImGui::Checkbox("Animated liquid glass", &objects[i].liquid_glass);
+    ImGui::PopID();
+  }
+  ImGui::End();
+
+  auto &post = state.post_process;
+  ImGui::Begin("Post-processing");
+  ImGui::Checkbox("Toon shading + outline", &post.toon);
+  ImGui::SeparatorText("Bloom");
+  ImGui::Checkbox("Enable bloom", &post.bloom);
+  ImGui::SliderFloat("Brightness threshold", &post.bloom_threshold, 0.1f, 3.0f);
+  ImGui::SliderFloat("Bloom intensity", &post.bloom_intensity, 0.0f, 4.0f);
+  ImGui::SliderFloat("Bloom radius", &post.bloom_radius, 1.0f, 20.0f);
   ImGui::End();
 }
 
 void render(const graphics::internal::FrameData &fd) {
   auto &context = graphics::internal::context;
+
+  if (vk_scene_extent.width != context.swapchain_extent.width ||
+      vk_scene_extent.height != context.swapchain_extent.height) {
+    vkDeviceWaitIdle(context.device);
+    if (!create_scene_target(context.swapchain_extent)) {
+      std::cerr << "Failed to resize post-processing target\n";
+      return;
+    }
+  }
 
   const float aspect = float(context.swapchain_extent.width) /
                        float(context.swapchain_extent.height);
@@ -973,8 +1451,11 @@ void render(const graphics::internal::FrameData &fd) {
       .ambient = glm::vec4(state.ambient_color, state.ambient_intensity),
       .sun_dir = glm::vec4(glm::normalize(state.sun_direction), 0.0f),
       .sun_color = glm::vec4(state.sun_color, state.sun_intensity),
-      .counts = glm::ivec4(int(state.point_lights.size()),
-                           int(state.spot_lights.size()), 0, 0),
+      .counts = glm::ivec4(
+          int(state.point_lights.size()), int(state.spot_lights.size()),
+          (state.post_process.toon ? 1 : 0) |
+              (state.post_process.bloom ? 2 : 0),
+          int(animation_time * 1000.0)),
   };
   scene_data.proj[1][1] *= -1.0f;
 
@@ -1009,16 +1490,35 @@ void render(const graphics::internal::FrameData &fd) {
   vmaFlushAllocation(context.allocator, vk_spot_lights_allocation, 0,
                      VK_WHOLE_SIZE);
 
-  const ObjectData object_data = {
-      .model = glm::mat4(1.0f),
-      .albedo = glm::vec4(state.material.albedo, 1.0f),
-      .specular = glm::vec4(state.material.specular, state.material.shininess),
-  };
-
   for (auto &object : objects) {
+    const ObjectData object_data = {
+        .model = glm::mat4(1.0f),
+        .albedo = glm::vec4(state.material.albedo, state.material.texture_scale),
+        .specular =
+            glm::vec4(state.material.specular, state.material.shininess),
+        .effect = glm::vec4(object.liquid_glass ? 1.0f : 0.0f,
+                            state.material.wave_amplitude,
+                            state.material.wave_frequency,
+                            state.material.wave_speed),
+    };
     std::memcpy(object.uniform_mapped, &object_data, sizeof(object_data));
     vmaFlushAllocation(context.allocator, object.uniform_allocation, 0,
                        VK_WHOLE_SIZE);
+
+    const VkDescriptorImageInfo texture_info = {
+        .sampler = vk_scene_sampler,
+        .imageView = textures[size_t(object.texture_index)].view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    const VkWriteDescriptorSet texture_write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = object.descriptor_set,
+        .dstBinding = 1,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = &texture_info,
+    };
+    vkUpdateDescriptorSets(context.device, 1, &texture_write, 0, nullptr);
   }
 
   const VkCommandBufferBeginInfo begin_info = {
@@ -1033,8 +1533,8 @@ void render(const graphics::internal::FrameData &fd) {
 
   const VkRenderPassBeginInfo render_pass_begin = {
       .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-      .renderPass = context.render_pass,
-      .framebuffer = fd.framebuffer,
+      .renderPass = vk_scene_render_pass,
+      .framebuffer = vk_scene_framebuffer,
       .renderArea = {.extent = context.swapchain_extent},
       .clearValueCount = 2,
       .pClearValues = clear_values,
@@ -1159,6 +1659,44 @@ void render(const graphics::internal::FrameData &fd) {
                        VK_WHOLE_SIZE);
   }
 
+  vkCmdEndRenderPass(fd.command_buffer);
+
+  ObjectData post_data = {
+      .model = glm::mat4(1.0f),
+      .albedo = glm::vec4(1.0f),
+      .specular = glm::vec4(0.0f, 0.0f, 0.0f, -1.0f),
+  };
+  post_data.model[1] = glm::vec4(state.post_process.bloom_threshold,
+                                 state.post_process.bloom_intensity,
+                                 state.post_process.bloom_radius, 0.0f);
+  char *post_slot = static_cast<char *>(vk_gizmo_uniform_mapped) +
+                    (GIZMO_SLOT_COUNT - 1) * GIZMO_SLOT_STRIDE;
+  std::memcpy(post_slot, &post_data, sizeof(post_data));
+  vmaFlushAllocation(context.allocator, vk_gizmo_uniform_allocation, 0,
+                     VK_WHOLE_SIZE);
+
+  const VkRenderPassBeginInfo final_pass_begin = {
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+      .renderPass = context.render_pass,
+      .framebuffer = fd.framebuffer,
+      .renderArea = {.extent = context.swapchain_extent},
+      .clearValueCount = 2,
+      .pClearValues = clear_values,
+  };
+  vkCmdBeginRenderPass(fd.command_buffer, &final_pass_begin,
+                       VK_SUBPASS_CONTENTS_INLINE);
+  vkCmdSetViewport(fd.command_buffer, 0, 1, &viewport);
+  vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
+  vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    vk_pipeline_post);
+  const VkDescriptorSet post_sets[] = {
+      vk_scene_descriptor_set,
+      vk_gizmo_descriptor_sets[GIZMO_SLOT_COUNT - 1],
+      vk_post_descriptor_set,
+  };
+  vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          vk_pipeline_layout, 0, 3, post_sets, 0, nullptr);
+  vkCmdDraw(fd.command_buffer, 3, 1, 0, 0);
   vkCmdEndRenderPass(fd.command_buffer);
 
   vkEndCommandBuffer(fd.command_buffer);
