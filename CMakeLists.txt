@@ -113,6 +113,7 @@ if(GLSLC_FOUND)
 	compile_shader(lighting.vert)
 	compile_shader(lighting.frag)
 	compile_shader(unlit.frag)
+	compile_shader(post.frag)
 
 	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 	add_dependencies(${PROJECT_NAME} shaders)
